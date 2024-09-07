@@ -1,21 +1,17 @@
 """Minimal model definition."""
 
-import os
-
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
-
-
 import functools
 import math
 import jax
 import jax.numpy as jnp
-from flax import struct, nnx
+from flax import struct
+from collections import namedtuple
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu import flash_attention
 import dataclasses
 import orbax.checkpoint as ocp
-from typing import Any, NamedTuple
+from typing import Any
 
 
 def create_mesh():
@@ -25,19 +21,19 @@ def create_mesh():
   return mesh
 
 
-class ShardingRules(NamedTuple):
-  batch: str | None
-  sequence: str | None
-  d_model: str | None
-  query_heads: str | None
-  key_heads: str | None
-  key_dim: str | None
-  ffw: str | None
-  vocab: str | None
-
-  def __call__(self, *keys: str) -> tuple[str, ...]:
-    return tuple(getattr(self, key) for key in keys)
-
+ShardingRules = namedtuple(
+  "FSDPRules",
+  [
+    "batch",
+    "sequence",
+    "d_model",
+    "query_heads",
+    "key_heads",
+    "key_dim",
+    "ffw",
+    "vocab",
+  ],
+)
 
 fsdp_rules = ShardingRules(
   batch="x",
@@ -62,7 +58,17 @@ mdl_parallel_rules = ShardingRules(
 )
 
 
-@dataclasses.dataclass
+def _logical_to_physical(logical: P, rules: ShardingRules):
+  """Converts logical to physical pspec."""
+  return P(*(getattr(rules, l) for l in logical))
+
+
+def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRules):
+  """Converts logical to sharding."""
+  return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
+
+
+@struct.dataclass
 class Config:
   d_model: int
   ffw_multiplier: int
@@ -87,146 +93,160 @@ class Config:
   total_steps: int = 10000
 
 
-class Layer(nnx.Module):
-  def __init__(self, cfg: Config, rngs: nnx.Rngs):
-    self.q = nnx.Param(
-      nnx.initializers.he_normal(in_axis=0, out_axis=(1, 2))(
-        rngs.params(),
-        (cfg.d_model, cfg.query_heads, cfg.key_dim),
-        dtype=cfg.weight_dtype,
+@struct.dataclass
+class Layer:
+  q: jax.Array
+  k: jax.Array
+  v: jax.Array
+  proj: jax.Array
+  w1: jax.Array
+  w2: jax.Array
+  gamma1: jax.Array
+  gamma2: jax.Array
+
+  @classmethod
+  def shape(cls, cfg: Config):
+    return Layer(
+      q=jax.ShapeDtypeStruct(
+        (cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype
       ),
-      sharding=cfg.rules("d_model", "query_heads", "key_dim"),
-    )
-    self.k = nnx.Param(
-      nnx.initializers.he_normal(in_axis=0, out_axis=(1, 2))(
-        rngs.params(),
-        (cfg.d_model, cfg.key_heads, cfg.key_dim),
-        dtype=cfg.weight_dtype,
+      k=jax.ShapeDtypeStruct(
+        (cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype
       ),
-      sharding=cfg.rules("d_model", "key_heads", "key_dim"),
-    )
-    self.v = nnx.Param(
-      nnx.initializers.he_normal(in_axis=0, out_axis=(1, 2))(
-        rngs.params(),
-        (cfg.d_model, cfg.key_heads, cfg.key_dim),
-        dtype=cfg.weight_dtype,
+      v=jax.ShapeDtypeStruct(
+        (cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype
       ),
-      sharding=cfg.rules("d_model", "key_heads", "key_dim"),
-    )
-    self.proj = nnx.Param(
-      nnx.initializers.he_normal(in_axis=(0, 1), out_axis=2)(
-        rngs.params(),
-        (cfg.query_heads, cfg.key_dim, cfg.d_model),
-        dtype=cfg.weight_dtype,
+      proj=jax.ShapeDtypeStruct(
+        (cfg.query_heads, cfg.key_dim, cfg.d_model), cfg.weight_dtype
       ),
-      sharding=cfg.rules("query_heads", "key_dim", "d_model"),
-    )
-    self.w1 = nnx.Param(
-      nnx.initializers.he_normal(in_axis=0, out_axis=1)(
-        rngs.params(),
-        (cfg.d_model, cfg.d_model * cfg.ffw_multiplier),
-        dtype=cfg.weight_dtype,
+      w1=jax.ShapeDtypeStruct(
+        (cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype
       ),
-      sharding=cfg.rules("d_model", "ffw"),
-    )
-    self.w2 = nnx.Param(
-      nnx.initializers.he_normal(in_axis=1, out_axis=0)(
-        rngs.params(),
-        (cfg.d_model * cfg.ffw_multiplier, cfg.d_model),
-        dtype=cfg.weight_dtype,
+      w2=jax.ShapeDtypeStruct(
+        (cfg.d_model * cfg.ffw_multiplier, cfg.d_model), cfg.weight_dtype
       ),
-      sharding=cfg.rules("ffw", "d_model"),
+      gamma1=jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
+      gamma2=jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
     )
-    self.gamma1 = nnx.Param(
-      jnp.ones((cfg.d_model,), dtype=cfg.weight_dtype),
-      sharding=cfg.rules("d_model"),
+
+  @classmethod
+  def logical_axes(cls, cfg: Config):
+    del cfg
+    return Layer(
+      q=P("d_model", "query_heads", "key_dim"),
+      k=P("d_model", "key_heads", "key_dim"),
+      v=P("d_model", "key_heads", "key_dim"),
+      proj=P("query_heads", "key_dim", "d_model"),
+      w1=P("d_model", "ffw"),
+      w2=P("ffw", "d_model"),
+      gamma1=P("d_model"),
+      gamma2=P("d_model"),
     )
-    self.gamma2 = nnx.Param(
-      jnp.ones((cfg.d_model,), dtype=cfg.weight_dtype),
-      sharding=cfg.rules("d_model"),
+
+  @classmethod
+  def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    return jax.tree.map(
+      lambda logical: _logical_to_sharding(logical, mesh, rules),
+      cls.logical_axes(cfg),
+    )
+
+  @classmethod
+  def init(cls, cfg: Config, key: jax.random.PRNGKey):
+    shape = cls.shape(cfg)
+    key, *subkeys = jax.random.split(key, 7)
+
+    return Layer(
+      q=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1, 2))(
+        subkeys[0], shape.q.shape, dtype=cfg.weight_dtype
+      ),
+      k=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1, 2))(
+        subkeys[1], shape.k.shape, dtype=cfg.weight_dtype
+      ),
+      v=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1, 2))(
+        subkeys[2], shape.v.shape, dtype=cfg.weight_dtype
+      ),
+      proj=jax.nn.initializers.he_normal(in_axis=(0, 1), out_axis=2)(
+        subkeys[3], shape.proj.shape, dtype=cfg.weight_dtype
+      ),
+      w1=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(
+        subkeys[4], shape.w1.shape, dtype=cfg.weight_dtype
+      ),
+      w2=jax.nn.initializers.he_normal(in_axis=1, out_axis=0)(
+        subkeys[5], shape.w2.shape, dtype=cfg.weight_dtype
+      ),
+      gamma1=jnp.ones(shape.gamma1.shape, dtype=cfg.weight_dtype),
+      gamma2=jnp.ones(shape.gamma2.shape, dtype=cfg.weight_dtype),
     )
 
 
-class Weights(nnx.Module, experimental_pytree=True):
-  def __init__(self, cfg: Config, rngs: nnx.Rngs):
-    self.layers = [Layer(cfg, rngs) for _ in range(cfg.num_layers)]
-    self.embedding = nnx.Param(
-      jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(
-        rngs.params(), (cfg.vocab_size, cfg.d_model), dtype=cfg.weight_dtype
-      ),
-      sharding=cfg.rules("vocab", "d_model"),
+@struct.dataclass
+class Weights:
+  layers: list[Layer]
+  embedding: jax.Array  # New field for token embeddings
+  vocab_proj: jax.Array  # New field for final vocabulary projection
+
+  @classmethod
+  def shape(cls, cfg: Config):
+    return Weights(
+      layers=[Layer.shape(cfg) for _ in range(cfg.num_layers)],
+      embedding=jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), jnp.float32),
+      vocab_proj=jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), jnp.float32),
     )
-    self.vocab_proj = nnx.Param(
-      jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(
-        rngs.params(), (cfg.d_model, cfg.vocab_size), dtype=cfg.weight_dtype
-      ),
-      sharding=cfg.rules("d_model", "vocab"),
+
+  @classmethod
+  def logical_axes(cls, cfg: Config):
+    return Weights(
+      layers=[Layer.logical_axes(cfg) for _ in range(cfg.num_layers)],
+      embedding=P("vocab", "d_model"),
+      vocab_proj=P("d_model", "vocab"),
+    )
+
+  @classmethod
+  def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    logical_axes = cls.logical_axes(cfg)
+    return Weights(
+      layers=[Layer.shardings(cfg, mesh, rules) for _ in range(cfg.num_layers)],
+      embedding=_logical_to_sharding(logical_axes.embedding, mesh, rules),
+      vocab_proj=_logical_to_sharding(logical_axes.vocab_proj, mesh, rules),
+    )
+
+  @classmethod
+  def abstract(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    return jax.tree.map(
+      lambda shape, shd: jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=shd),
+      Weights.shape(cfg),
+      Weights.shardings(cfg, mesh, rules),
     )
 
   @classmethod
   def init(
     cls,
     cfg: Config,
-    rngs: nnx.Rngs,
+    key: jax.random.PRNGKey,
+    mesh: jax.sharding.Mesh,
+    rules: ShardingRules,
     use_low_mem_init: bool = False,
-  ) -> "Weights":
+  ):
+    def _init():
+      shape = cls.shape(cfg)
+      keys = jax.random.split(
+        key, cfg.num_layers + 2
+      )  # +2 for embedding and vocab_proj
+      return Weights(
+        layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
+        embedding=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(
+          keys[-2], shape.embedding.shape, dtype=cfg.weight_dtype
+        ),
+        vocab_proj=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(
+          keys[-1], shape.vocab_proj.shape, dtype=cfg.weight_dtype
+        ),
+      )
+
     # This takes ~10-20s instead of 0.1s to init, but will init sharded. Use this when the
     # weights would be too big for one device.
-    # Ideal version with Pytree Modules:
-    def init_fn():
-      return cls(cfg, nnx.clone(rngs))
-
-    assert cfg.mesh is not None
-    shardings = nnx.get_named_sharding(jax.eval_shape(init_fn), cfg.mesh)
     if use_low_mem_init:
-      return jax.jit(init_fn, out_shardings=shardings)()
-    return jax.device_put(cls(cfg, rngs), shardings)
-
-    # Current state version we use:
-    # def create_fn(rngs):
-    #   weights = cls(cfg, rngs)
-    #   state = nnx.state(weights)
-    #   shardings = nnx.get_named_sharding(state, mesh)
-    #   if use_low_mem_init:
-    #     state = jax.lax.with_sharding_constraint(state, shardings)
-    #   else:
-    #     state = jax.device_put(state, shardings)
-    #   nnx.update(weights, state)
-    #   return weights
-
-    # if use_low_mem_init:
-    #   return jax.jit(create_fn)(rngs)
-    # return create_fn(rngs)
-
-
-test_cfg = Config(
-  d_model=4 * 64,
-  ffw_multiplier=4,
-  query_heads=4,
-  key_heads=4,
-  num_layers=1,
-  key_dim=64,
-  vocab_size=1000,
-  max_seq_len=1024,
-  causal=True,
-  use_attn_kernel=True,
-  weight_dtype=jnp.float32,
-  rules=ShardingRules(
-    batch="x",
-    sequence=None,
-    d_model="x",
-    query_heads=None,
-    key_heads=None,
-    key_dim=None,
-    ffw=None,
-    vocab=None,
-  ),
-  mesh=create_mesh(),
-)
-model = Weights.init(test_cfg, nnx.Rngs(0), use_low_mem_init=True)
-print(model)
-
-exit()
+      _init = jax.jit(_init, out_shardings=cls.shardings(cfg, mesh, rules))
+    return jax.device_put(_init(), cls.shardings(cfg, mesh, rules))
 
 
 @struct.dataclass
